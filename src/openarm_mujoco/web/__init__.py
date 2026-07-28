@@ -1,4 +1,4 @@
-# Copyright 2025 Enactic, Inc.
+# Copyright 2026 Enactic, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-**/tmp/*
-*.egg-info/
-*.pyc
-.DS_Store
-/build/
-__pycache__/
+"""Serve the OpenArm web interface."""
 
-# TLS material for local HTTPS (never commit private keys)
-*.crt
-*.key
-*.pem
+from .app import app as app
+from .app import create_app as create_app

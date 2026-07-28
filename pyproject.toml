@@ -30,6 +30,12 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
 [project.urls]
 Changelog = "https://github.com/enactic/openarm_mujoco/releases"
 Issues = "https://github.com/enactic/openarm_mujoco/issues"
@@ -37,6 +43,7 @@ Repository = "https://github.com/enactic/openarm_mujoco.git"
 
 [project.scripts]
 openarm-mujoco-launch = "openarm_mujoco.v2.launch:main"
+openarm-mujoco-web = "openarm_mujoco.web.app:main"
 
 [dependency-groups]
 dev = [
@@ -57,3 +64,6 @@ extend-select = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"openarm_mujoco.web" = ["static/*"]
