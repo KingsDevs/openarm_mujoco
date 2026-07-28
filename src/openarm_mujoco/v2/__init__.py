@@ -78,7 +78,7 @@ def openarm_bimanual_paths() -> list[str]:
 
 def openarm_cell_xml() -> str:
     """Return the XML path for OpenArm in OpenArm Cell."""
-    return asset_path("cell.xml")
+    return asset_path("articulated_scene.xml")
 
 
 def openarm_demo_xml() -> str:
