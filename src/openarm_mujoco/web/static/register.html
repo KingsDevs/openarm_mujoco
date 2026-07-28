@@ -110,6 +110,18 @@
               </span>
               <span id="yaw" class="reading fs-2">—</span>
             </div>
+            <hr class="my-1" />
+            <div
+              class="d-flex align-items-center justify-content-between pt-2 small"
+            >
+              <span class="text-body-secondary">Socket</span>
+              <span>
+                <span id="sent" class="reading text-body-secondary"></span>
+                <span id="ws-status" class="badge text-bg-secondary ms-2"
+                  >connecting…</span
+                >
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -118,6 +130,7 @@
     <script>
       const $ = (id) => document.getElementById(id);
       const fmt = (v) => (v === null || v === undefined ? "—" : v.toFixed(1));
+      const round = (v) => (v === null || v === undefined ? 0 : +v.toFixed(2));
 
       // --- Step 1: phone detection -------------------------------------
       // No single reliable check exists: UA strings are spoofable and
@@ -188,10 +201,53 @@
       }
 
       // --- Step 2: permission, then stream orientation -----------------
+      const SEND_HZ = 30;
+      let latest = null;
+      let sent = 0;
+
       function onOrientation(e) {
         $("pitch").textContent = fmt(e.beta);
         $("roll").textContent = fmt(e.gamma);
         $("yaw").textContent = fmt(e.alpha);
+        // Buffer the sample; the socket sends on its own fixed cadence so the
+        // sensor rate never dictates how much we put on the wire.
+        latest = { pitch: e.beta, roll: e.gamma, yaw: e.alpha };
+      }
+
+      // --- WebSocket ---------------------------------------------------
+      // Origin-relative so this works over the tailnet, a LAN cert, or a
+      // tunnel without hardcoding a host, and never trips mixed content.
+      let ws = null;
+
+      function setStatus(text, variant) {
+        const el = $("ws-status");
+        el.textContent = text;
+        el.className = `badge text-bg-${variant} ms-2`;
+      }
+
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+        ws.addEventListener("open", () => setStatus("live", "success"));
+        ws.addEventListener("close", () => {
+          setStatus("reconnecting…", "warning");
+          setTimeout(connect, 1000);
+        });
+        ws.addEventListener("error", () => ws.close());
+      }
+
+      function pump() {
+        if (!latest || !ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(
+          JSON.stringify({
+            pitch: round(latest.pitch),
+            roll: round(latest.roll),
+            yaw: round(latest.yaw),
+          }),
+        );
+        latest = null;
+        $("sent").textContent = `${++sent} sent`;
       }
 
       // iOS 13+ gates this behind an explicit request from a user gesture.
@@ -211,6 +267,8 @@
           window.addEventListener("deviceorientation", onOrientation);
           $("enable").classList.add("d-none");
           $("readouts").classList.remove("d-none");
+          connect();
+          setInterval(pump, 1000 / SEND_HZ);
         } catch (e) {
           err.textContent = `Could not start the IMU: ${e.message}`;
           err.classList.remove("d-none");

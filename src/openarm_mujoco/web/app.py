@@ -15,15 +15,71 @@
 """FastAPI application serving the OpenArm welcome page."""
 
 import argparse
+import json
+import logging
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 _STATIC_ROOT = Path(__file__).parent / "static"
 _INDEX_FILE = _STATIC_ROOT / "index.html"
 _REGISTER_FILE = _STATIC_ROOT / "register.html"
+
+_ORIENTATION_FIELDS = ("pitch", "roll", "yaw")
+_LOG_EVERY = 30
+
+# Log through uvicorn's own logger so frames appear in the server output
+# without the caller having to configure logging first.
+_logger = logging.getLogger("uvicorn.error")
+
+
+def parse_orientation(payload: str) -> dict[str, float] | None:
+    """Parse an orientation frame, returning None when it is malformed.
+
+    A phone can send anything, so a bad frame must be dropped rather than
+    tear down the socket.
+    """
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+
+    if not isinstance(decoded, dict):
+        return None
+
+    reading: dict[str, float] = {}
+    for field in _ORIENTATION_FIELDS:
+        value = decoded.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        reading[field] = float(value)
+
+    return reading
+
+
+class OrientationState:
+    """Hold the most recent orientation sample received from a phone."""
+
+    def __init__(self) -> None:
+        """Start with no samples recorded."""
+        self.reading: dict[str, float] | None = None
+        self.samples = 0
+        self.clients = 0
+
+    def update(self, reading: dict[str, float]) -> None:
+        """Record a new sample."""
+        self.reading = reading
+        self.samples += 1
+
+    def snapshot(self) -> dict[str, object]:
+        """Return the current state as a JSON-serialisable mapping."""
+        return {
+            "reading": self.reading,
+            "samples": self.samples,
+            "clients": self.clients,
+        }
 
 
 def create_app() -> FastAPI:
@@ -48,6 +104,40 @@ def create_app() -> FastAPI:
     def register() -> FileResponse:
         """Return the device registration page."""
         return FileResponse(_REGISTER_FILE)
+
+    state = OrientationState()
+    application.state.orientation = state
+
+    @application.websocket("/ws")
+    async def orientation_socket(websocket: WebSocket) -> None:
+        """Receive a stream of pitch/roll/yaw frames from a phone."""
+        await websocket.accept()
+        state.clients += 1
+        _logger.info("orientation client connected (%d active)", state.clients)
+        try:
+            while True:
+                reading = parse_orientation(await websocket.receive_text())
+                if reading is None:
+                    continue
+                state.update(reading)
+                if state.samples % _LOG_EVERY == 0:
+                    _logger.info(
+                        "pitch=%7.1f roll=%7.1f yaw=%7.1f (%d samples)",
+                        reading["pitch"],
+                        reading["roll"],
+                        reading["yaw"],
+                        state.samples,
+                    )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            state.clients -= 1
+            _logger.info("orientation client left (%d active)", state.clients)
+
+    @application.get("/orientation")
+    def orientation() -> dict[str, object]:
+        """Return the most recent orientation sample."""
+        return state.snapshot()
 
     @application.get("/health")
     def health() -> dict[str, str]:
