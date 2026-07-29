@@ -127,43 +127,14 @@
       </div>
     </div>
 
+    <script src="/static/device.js"></script>
     <script>
       const $ = (id) => document.getElementById(id);
       const fmt = (v) => (v === null || v === undefined ? "—" : v.toFixed(1));
       const round = (v) => (v === null || v === undefined ? 0 : +v.toFixed(2));
 
-      // --- Step 1: phone detection -------------------------------------
-      // No single reliable check exists: UA strings are spoofable and
-      // iPadOS reports itself as "Macintosh". Combine several signals.
-      function detect() {
-        const ua = navigator.userAgent;
-        const uaData = navigator.userAgentData;
-
-        const signals = {
-          "navigator.userAgentData.mobile":
-            uaData && typeof uaData.mobile === "boolean" ? uaData.mobile : null,
-          "mobile UA string":
-            /Android|iPhone|iPod|Windows Phone|webOS|BlackBerry|Opera Mini|IEMobile/i.test(
-              ua,
-            ),
-          "iPadOS (Mac UA + touch)":
-            /Macintosh/.test(ua) && navigator.maxTouchPoints > 1,
-          "touch points > 0": navigator.maxTouchPoints > 0,
-          "pointer: coarse": window.matchMedia("(pointer: coarse)").matches,
-          "DeviceOrientationEvent exists": "DeviceOrientationEvent" in window,
-        };
-
-        // Treat as a phone when a mobile identity signal agrees with touch.
-        const identity =
-          signals["navigator.userAgentData.mobile"] === true ||
-          signals["mobile UA string"] ||
-          signals["iPadOS (Mac UA + touch)"];
-        const isPhone = identity && signals["touch points > 0"];
-
-        return { signals, isPhone };
-      }
-
-      const { signals, isPhone } = detect();
+      // --- Step 1: phone detection (see /static/device.js) --------------
+      const { signals, isPhone } = detectDevice();
 
       const list = $("signals");
       for (const [name, value] of Object.entries(signals)) {
@@ -201,7 +172,7 @@
       }
 
       // --- Step 2: permission, then stream orientation -----------------
-      const SEND_HZ = 30;
+      const SEND_HZ = 20;
       let latest = null;
       let sent = 0;
 

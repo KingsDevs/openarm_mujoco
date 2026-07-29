@@ -35,6 +35,7 @@ web = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "websockets>=12",
+    "qrcode>=8",
 ]
 
 [project.urls]
@@ -45,6 +46,7 @@ Repository = "https://github.com/enactic/openarm_mujoco.git"
 [project.scripts]
 openarm-mujoco-launch = "openarm_mujoco.v2.launch:main"
 openarm-mujoco-web = "openarm_mujoco.web.app:main"
+openarm-mujoco-teleop = "openarm_mujoco.teleop.app:main"
 
 [dependency-groups]
 dev = [
@@ -67,4 +69,4 @@ extend-select = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"openarm_mujoco.web" = ["static/*"]
+"openarm_mujoco.web" = ["static/*.html", "static/*.js"]

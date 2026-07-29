@@ -28,6 +28,19 @@
             transparent 50%
           );
       }
+      /* QR codes need a light quiet zone to scan reliably, so this panel
+         stays white regardless of the page theme. */
+      .qr-panel {
+        background: #fff;
+        border-radius: 0.75rem;
+        padding: 0.75rem;
+        line-height: 0;
+      }
+      .qr-panel img {
+        width: 180px;
+        height: 180px;
+        display: block;
+      }
     </style>
   </head>
   <body>
@@ -36,7 +49,49 @@
       <p class="lead text-body-secondary mb-4">
         by <span class="fw-semibold">Couliglig</span>
       </p>
-      <a class="btn btn-primary btn-lg px-4" href="/register">Register</a>
+
+      <!-- Phones register directly; everything else gets a QR to scan. -->
+      <a id="register" class="btn btn-primary btn-lg px-4 d-none" href="/register"
+        >Register</a
+      >
+
+      <div id="qr-block" class="d-none">
+        <p class="text-body-secondary mb-3">
+          Scan with your phone to register
+        </p>
+        <div class="d-inline-block qr-panel">
+          <img id="qr" alt="QR code linking to the registration page" />
+        </div>
+        <p class="small text-body-secondary mt-3 mb-0">
+          <code id="qr-url"></code>
+        </p>
+      </div>
     </main>
+
+    <script src="/static/device.js"></script>
+    <script>
+      const { isPhone } = detectDevice();
+
+      if (isPhone) {
+        document.getElementById("register").classList.remove("d-none");
+      } else {
+        // Ask the server which URL the phone should open — the browser's own
+        // origin may be localhost, which is useless in a QR code.
+        fetch("/api/public-url")
+          .then((r) => r.json())
+          .then(({ url }) => {
+            const target = `${url}/register`;
+            document.getElementById("qr").src =
+              `/qr.svg?url=${encodeURIComponent(target)}`;
+            document.getElementById("qr-url").textContent = target;
+            document.getElementById("qr-block").classList.remove("d-none");
+          })
+          .catch(() => {
+            document.getElementById("qr-url").textContent =
+              "Could not determine the server URL.";
+            document.getElementById("qr-block").classList.remove("d-none");
+          });
+      }
+    </script>
   </body>
 </html>
