@@ -46,7 +46,6 @@ Repository = "https://github.com/enactic/openarm_mujoco.git"
 [project.scripts]
 openarm-mujoco-launch = "openarm_mujoco.v2.launch:main"
 openarm-mujoco-web = "openarm_mujoco.web.app:main"
-openarm-mujoco-teleop = "openarm_mujoco.teleop.app:main"
 
 [dependency-groups]
 dev = [

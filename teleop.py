@@ -18,6 +18,12 @@ Controls (keyboard, if Ctrl+right-drag is awkward on your pointer):
   o / p        toggle left / right gripper
   r            reset targets back to the current hand poses
   space        pause physics
+
+Controls (phones, with --phone):
+  Two phones, one per hand. Scan the QR for an arm, allow motion access, then
+  hold HOLD TO CONTROL. While held, rotating the phone rotates that hand and
+  tilting past the deadzone moves it; up/down buttons raise and lower it, and
+  Gripper toggles the jaws. Releasing freezes the hand where it is.
 """
 
 import argparse
@@ -150,10 +156,136 @@ class ArmIK:
         d.ctrl[self.grip_act] = self.grip_closed if self.closed else self.grip_open
 
 
+# --- phone teleop ---------------------------------------------------------
+# One phone per hand, driving the same mocap targets the mouse and keyboard
+# drive. Motion is relative to the pose held when the clutch engaged, so the
+# hand never snaps to the phone's absolute attitude and gyro yaw drift is
+# reset on every press instead of accumulating.
+PHONE_DEADZONE = 12.0  # deg of tilt before the hand starts translating
+PHONE_TILT_SPAN = 45.0  # deg beyond the deadzone that maps to full speed
+PHONE_SPEED = 0.30  # m/s at full tilt
+PHONE_LIFT_SPEED = 0.20  # m/s while up/down is held
+PHONE_SIGN_X = -1.0  # flip if tilting away drives the hand backwards
+PHONE_SIGN_Y = -1.0
+PHONE_MAX_REACH = 0.9  # m the target may stray from where it started
+
+
+def orientation_quat(pitch: float, roll: float, yaw: float) -> np.ndarray:
+    """Convert DeviceOrientation angles in degrees to a quaternion.
+
+    Uses the intrinsic Z-X'-Y'' order from the W3C DeviceOrientation spec,
+    where beta is X (pitch), gamma is Y (roll) and alpha is Z (yaw).
+    """
+    half = np.radians([pitch, roll, yaw]) / 2.0
+    (cx, cy, cz), (sx, sy, sz) = np.cos(half), np.sin(half)
+    return np.array(
+        [
+            cx * cy * cz - sx * sy * sz,
+            sx * cy * cz - cx * sy * sz,
+            cx * sy * cz + sx * cy * sz,
+            cx * cy * sz + sx * sy * cz,
+        ]
+    )
+
+
+def tilt_velocity(delta: float) -> float:
+    """Map tilt past the deadzone onto a speed, ramping to PHONE_SPEED."""
+    magnitude = abs(delta) - PHONE_DEADZONE
+    if magnitude <= 0.0:
+        return 0.0
+    return np.sign(delta) * PHONE_SPEED * min(magnitude / PHONE_TILT_SPAN, 1.0)
+
+
+class PhoneDriver:
+    """Steer one arm's mocap target from that arm's phone."""
+
+    def __init__(self, arm_ik, data):
+        self.ik = arm_ik
+        self.d = data
+        self.home = data.mocap_pos[arm_ik.mocap].copy()
+        self.ref = None  # phone attitude latched at engage
+
+    def _engage(self, reading):
+        """Latch the phone and hand poses so motion is relative to them."""
+        self.ref = orientation_quat(
+            reading["pitch"], reading["roll"], reading["yaw"]
+        )
+        self.ref_pitch = reading["pitch"]
+        self.ref_roll = reading["roll"]
+        self.hand = self.d.mocap_quat[self.ik.mocap].copy()
+
+    def apply(self, reading, dt):
+        """Advance this arm's target from the latest phone frame."""
+        if reading is None or not reading.get("engaged"):
+            self.ref = None  # next press re-latches from wherever we stopped
+            return
+        if self.ref is None:
+            self._engage(reading)
+            return  # first engaged frame only calibrates; no motion
+
+        # Orientation: apply the rotation accumulated since engage.
+        now = orientation_quat(reading["pitch"], reading["roll"], reading["yaw"])
+        inverse, delta, target = np.zeros(4), np.zeros(4), np.zeros(4)
+        mujoco.mju_negQuat(inverse, self.ref)
+        mujoco.mju_mulQuat(delta, inverse, now)
+        mujoco.mju_mulQuat(target, self.hand, delta)
+        self.d.mocap_quat[self.ik.mocap] = target
+
+        # Position: tilt past the deadzone becomes velocity; buttons do z.
+        step = np.array(
+            [
+                PHONE_SIGN_X * tilt_velocity(reading["pitch"] - self.ref_pitch),
+                PHONE_SIGN_Y * tilt_velocity(reading["roll"] - self.ref_roll),
+                PHONE_LIFT_SPEED * float(reading.get("lift", 0)),
+            ]
+        )
+        moved = self.d.mocap_pos[self.ik.mocap] + step * dt
+        # Keep a runaway target inside reach instead of dragging the arm to
+        # its limits and leaving the IK stuck against them.
+        offset = moved - self.home
+        if (norm := np.linalg.norm(offset)) > PHONE_MAX_REACH:
+            moved = self.home + offset * (PHONE_MAX_REACH / norm)
+        self.d.mocap_pos[self.ik.mocap] = moved
+
+        self.ik.closed = bool(reading.get("grip"))
+
+
+def serve_phones(host: str, port: int):
+    """Start the phone web server on a background thread.
+
+    Returns the shared OrientationState the sockets write into. The viewer
+    stays on the main thread, which is where MuJoCo wants it.
+    """
+    import threading
+
+    import uvicorn
+
+    from openarm_mujoco.web.app import app, resolve_public_url, tailnet_url
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=host, port=port, log_level="warning")
+    )
+    threading.Thread(target=server.run, daemon=True).start()
+
+    url = tailnet_url() or f"http://{host}:{port}"
+    print(f"\nphone control: open {url} and scan one QR per arm")
+    print(f"  left  -> {url}/register?arm=left")
+    print(f"  right -> {url}/register?arm=right\n")
+    del resolve_public_url  # imported only to fail fast if the app is broken
+    return app.state.orientation
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("xml", nargs="?", default=openarm_mujoco.openarm_pedestal_xml())
     ap.add_argument("--keyframe", "-k", default="home")
+    ap.add_argument(
+        "--phone",
+        action="store_true",
+        help="Serve the phone control pages and drive each hand from a phone.",
+    )
+    ap.add_argument("--phone-host", default="127.0.0.1", help="Web server bind address.")
+    ap.add_argument("--phone-port", type=int, default=8000, help="Web server port.")
     args = ap.parse_args()
 
     model = build(args.xml)
@@ -206,6 +338,13 @@ def main() -> int:
         elif code in JOG:
             data.mocap_pos[arms[active[0]].mocap] += JOG[code]
 
+    orientation = serve_phones(args.phone_host, args.phone_port) if args.phone else None
+    drivers = (
+        {arm: PhoneDriver(ik, data) for arm, ik in zip(ARMS, arms)}
+        if orientation
+        else {}
+    )
+
     print(__doc__)
     with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as v:
         v.cam.lookat[:] = model.stat.center
@@ -217,6 +356,8 @@ def main() -> int:
             # target cubes select but never move.
             mujoco.mjv_applyPerturbPose(model, data, v.perturb, 0)
             if not paused[0]:
+                for arm, driver in drivers.items():
+                    driver.apply(orientation.arms[arm].reading, model.opt.timestep)
                 for a in arms:
                     a.step(ghost)
                 mujoco.mj_step(model, data)

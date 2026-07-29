@@ -50,11 +50,12 @@ _QR_MAX_URL_LENGTH = 512
 _logger = logging.getLogger("uvicorn.error")
 
 
-def parse_orientation(payload: str) -> dict[str, float] | None:
-    """Parse an orientation frame, returning None when it is malformed.
+def parse_orientation(payload: str) -> dict[str, object] | None:
+    """Parse a control frame, returning None when it is malformed.
 
     A phone can send anything, so a bad frame must be dropped rather than
-    tear down the socket.
+    tear down the socket. Angles are required; the clutch, gripper and lift
+    controls default to inactive so an older client still parses.
     """
     try:
         decoded = json.loads(payload)
@@ -64,12 +65,20 @@ def parse_orientation(payload: str) -> dict[str, float] | None:
     if not isinstance(decoded, dict):
         return None
 
-    reading: dict[str, float] = {}
+    reading: dict[str, object] = {}
     for field in _ORIENTATION_FIELDS:
         value = decoded.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         reading[field] = float(value)
+
+    reading["engaged"] = decoded.get("engaged") is True
+    reading["grip"] = decoded.get("grip") is True
+
+    lift = decoded.get("lift")
+    if isinstance(lift, bool) or not isinstance(lift, (int, float)):
+        lift = 0
+    reading["lift"] = max(-1, min(1, int(lift)))
 
     return reading
 
@@ -126,12 +135,16 @@ class ArmController:
 
     def __init__(self) -> None:
         """Start unclaimed, with no samples recorded."""
-        self.reading: dict[str, float] | None = None
+        self.reading: dict[str, object] | None = None
         self.samples = 0
         self.connected = False
 
-    def update(self, reading: dict[str, float]) -> None:
-        """Record a new sample."""
+    def update(self, reading: dict[str, object]) -> None:
+        """Record a new sample.
+
+        Replaces the dict rather than mutating it so the teleop thread always
+        observes a fully built frame without needing a lock.
+        """
         self.reading = reading
         self.samples += 1
 

@@ -31,6 +31,13 @@
         min-width: 5.5ch;
         text-align: right;
       }
+      /* Held controls must not scroll, zoom or select the page under them. */
+      .hold {
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
     </style>
   </head>
   <body>
@@ -87,7 +94,29 @@
 
         <div id="perm-error" class="alert alert-danger d-none"></div>
 
-        <div id="readouts" class="card bg-body-tertiary border-0 d-none">
+        <!-- Clutch: the arm only moves while this is held, so putting the
+             phone down freezes the hand instead of flinging it. -->
+        <div id="controls" class="d-none mb-4">
+          <button
+            id="clutch"
+            class="btn btn-success btn-lg w-100 py-4 mb-3 hold fw-semibold"
+          >
+            HOLD TO CONTROL
+          </button>
+          <div class="d-flex gap-2 mb-2">
+            <button id="lift-up" class="btn btn-outline-light flex-fill hold">
+              &#9650; up
+            </button>
+            <button id="lift-down" class="btn btn-outline-light flex-fill hold">
+              &#9660; down
+            </button>
+          </div>
+          <button id="grip" class="btn btn-outline-light w-100">
+            Gripper: open
+          </button>
+        </div>
+
+        <div id="readouts" class="card bg-body-tertiary border-0 d-none"
           <div class="card-body">
             <div
               class="d-flex align-items-baseline justify-content-between py-2"
@@ -201,6 +230,71 @@
       const SEND_HZ = 20;
       let latest = null;
       let sent = 0;
+      let engaged = false;
+      let grip = false;
+      let lift = 0;
+
+      // A press-and-hold control. Release fires on every way a press can end,
+      // so a finger sliding off never leaves the arm latched on.
+      function onHold(el, press, release) {
+        el.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          press();
+        });
+        for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
+          el.addEventListener(ev, (e) => {
+            e.preventDefault();
+            release();
+          });
+        }
+      }
+
+      function setupControls() {
+        const clutch = $("clutch");
+        onHold(
+          clutch,
+          () => {
+            engaged = true;
+            clutch.textContent = "CONTROLLING";
+            clutch.classList.replace("btn-success", "btn-danger");
+          },
+          () => {
+            engaged = false;
+            clutch.textContent = "HOLD TO CONTROL";
+            clutch.classList.replace("btn-danger", "btn-success");
+          },
+        );
+
+        onHold(
+          $("lift-up"),
+          () => (lift = 1),
+          () => (lift = 0),
+        );
+        onHold(
+          $("lift-down"),
+          () => (lift = -1),
+          () => (lift = 0),
+        );
+
+        const gripBtn = $("grip");
+        gripBtn.addEventListener("click", () => {
+          grip = !grip;
+          gripBtn.textContent = `Gripper: ${grip ? "closed" : "open"}`;
+          gripBtn.classList.toggle("btn-warning", grip);
+          gripBtn.classList.toggle("btn-outline-light", !grip);
+        });
+
+        // Screen lock or tab-away must stop the arm dead, not leave it engaged.
+        const disengage = () => {
+          engaged = false;
+          lift = 0;
+        };
+        window.addEventListener("pagehide", disengage);
+        window.addEventListener("blur", disengage);
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) disengage();
+        });
+      }
 
       function onOrientation(e) {
         $("pitch").textContent = fmt(e.beta);
@@ -263,6 +357,9 @@
             pitch: round(latest.pitch),
             roll: round(latest.roll),
             yaw: round(latest.yaw),
+            engaged,
+            grip,
+            lift,
           }),
         );
         latest = null;
@@ -285,7 +382,9 @@
           }
           window.addEventListener("deviceorientation", onOrientation);
           $("enable").classList.add("d-none");
+          $("controls").classList.remove("d-none");
           $("readouts").classList.remove("d-none");
+          setupControls();
           connect();
           setInterval(pump, 1000 / SEND_HZ);
         } catch (e) {
