@@ -50,46 +50,64 @@
         by <span class="fw-semibold">Couliglig</span>
       </p>
 
-      <!-- Phones register directly; everything else gets a QR to scan. -->
-      <a id="register" class="btn btn-primary btn-lg px-4 d-none" href="/register"
-        >Register</a
-      >
+      <!-- The arm is baked into the link, so each phone drives exactly one. -->
+      <div id="phone-block" class="d-none">
+        <p class="text-body-secondary mb-3">Register this phone as</p>
+        <div class="d-flex gap-3 justify-content-center flex-wrap">
+          <a class="btn btn-primary btn-lg px-4" href="/register?arm=left"
+            >Left arm</a
+          >
+          <a class="btn btn-primary btn-lg px-4" href="/register?arm=right"
+            >Right arm</a
+          >
+        </div>
+      </div>
 
       <div id="qr-block" class="d-none">
-        <p class="text-body-secondary mb-3">
-          Scan with your phone to register
+        <p class="text-body-secondary mb-4">
+          Bimanual control needs two phones &mdash; scan one code per arm
         </p>
-        <div class="d-inline-block qr-panel">
-          <img id="qr" alt="QR code linking to the registration page" />
-        </div>
-        <p class="small text-body-secondary mt-3 mb-0">
-          <code id="qr-url"></code>
-        </p>
+        <div class="row g-4 justify-content-center" id="qr-row"></div>
+        <p id="qr-error" class="small text-danger mt-3 mb-0"></p>
       </div>
     </main>
 
     <script src="/static/device.js"></script>
     <script>
+      const ARMS = ["left", "right"];
       const { isPhone } = detectDevice();
 
       if (isPhone) {
-        document.getElementById("register").classList.remove("d-none");
+        document.getElementById("phone-block").classList.remove("d-none");
       } else {
+        document.getElementById("qr-block").classList.remove("d-none");
         // Ask the server which URL the phone should open — the browser's own
         // origin may be localhost, which is useless in a QR code.
         fetch("/api/public-url")
           .then((r) => r.json())
           .then(({ url }) => {
-            const target = `${url}/register`;
-            document.getElementById("qr").src =
-              `/qr.svg?url=${encodeURIComponent(target)}`;
-            document.getElementById("qr-url").textContent = target;
-            document.getElementById("qr-block").classList.remove("d-none");
+            const row = document.getElementById("qr-row");
+            for (const arm of ARMS) {
+              const target = `${url}/register?arm=${arm}`;
+              const col = document.createElement("div");
+              col.className = "col-auto";
+              col.innerHTML = `
+                <h2 class="h6 text-uppercase text-body-secondary mb-3">
+                  ${arm} arm
+                </h2>
+                <div class="d-inline-block qr-panel">
+                  <img alt="QR code to control the ${arm} arm"
+                       src="/qr.svg?url=${encodeURIComponent(target)}">
+                </div>
+                <p class="small text-body-secondary mt-2 mb-0">
+                  <code>?arm=${arm}</code>
+                </p>`;
+              row.append(col);
+            }
           })
           .catch(() => {
-            document.getElementById("qr-url").textContent =
+            document.getElementById("qr-error").textContent =
               "Could not determine the server URL.";
-            document.getElementById("qr-block").classList.remove("d-none");
           });
       }
     </script>

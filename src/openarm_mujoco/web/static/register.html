@@ -38,7 +38,19 @@
       <a href="/" class="text-decoration-none text-body-secondary small"
         >&larr; Back</a
       >
-      <h1 class="h2 fw-bold mt-3 mb-4">Register device</h1>
+      <div class="d-flex align-items-center gap-2 mt-3 mb-4">
+        <h1 class="h2 fw-bold mb-0">Register device</h1>
+        <span id="arm-badge" class="badge text-bg-primary d-none"></span>
+      </div>
+
+      <!-- Shown only when the link carried no ?arm=, e.g. typed by hand. -->
+      <div id="arm-picker" class="alert alert-secondary d-none">
+        <p class="mb-3">Which arm should this phone control?</p>
+        <div class="d-flex gap-2">
+          <a class="btn btn-primary flex-fill" href="?arm=left">Left arm</a>
+          <a class="btn btn-primary flex-fill" href="?arm=right">Right arm</a>
+        </div>
+      </div>
 
       <!-- Step 1: is this a phone? -->
       <div class="card bg-body-tertiary border-0 mb-4">
@@ -133,6 +145,19 @@
       const fmt = (v) => (v === null || v === undefined ? "—" : v.toFixed(1));
       const round = (v) => (v === null || v === undefined ? 0 : +v.toFixed(2));
 
+      // --- Which arm does this phone drive? -----------------------------
+      const ARMS = ["left", "right"];
+      const arm = new URLSearchParams(location.search).get("arm");
+      const hasArm = ARMS.includes(arm);
+
+      if (hasArm) {
+        const badge = $("arm-badge");
+        badge.textContent = `${arm} arm`;
+        badge.classList.remove("d-none");
+      } else {
+        $("arm-picker").classList.remove("d-none");
+      }
+
       // --- Step 1: phone detection (see /static/device.js) --------------
       const { signals, isPhone } = detectDevice();
 
@@ -167,7 +192,8 @@
       } else if (!secure) {
         $("insecure-origin").textContent = window.location.origin;
         $("insecure").classList.remove("d-none");
-      } else {
+      } else if (hasArm) {
+        // Without an arm the picker is showing instead; nothing to enable yet.
         $("imu-section").classList.remove("d-none");
       }
 
@@ -196,12 +222,34 @@
         el.className = `badge text-bg-${variant} ms-2`;
       }
 
+      let refused = false;
+
       function connect() {
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws = new WebSocket(`${proto}//${location.host}/ws?arm=${arm}`);
 
         ws.addEventListener("open", () => setStatus("live", "success"));
+
+        // The server confirms the claim, or refuses it when the other phone
+        // already holds this arm. Retrying a refusal would just spam it.
+        ws.addEventListener("message", (e) => {
+          let msg;
+          try {
+            msg = JSON.parse(e.data);
+          } catch {
+            return;
+          }
+          if (msg.type === "error") {
+            refused = true;
+            setStatus("refused", "danger");
+            const err = $("perm-error");
+            err.textContent = msg.message;
+            err.classList.remove("d-none");
+          }
+        });
+
         ws.addEventListener("close", () => {
+          if (refused) return;
           setStatus("reconnecting…", "warning");
           setTimeout(connect, 1000);
         });

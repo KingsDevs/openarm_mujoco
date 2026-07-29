@@ -36,6 +36,9 @@ _REGISTER_FILE = _STATIC_ROOT / "register.html"
 _ORIENTATION_FIELDS = ("pitch", "roll", "yaw")
 _LOG_EVERY = 30
 
+#: One controlling phone per arm of the bimanual model.
+_ARMS = ("left", "right")
+
 #: Overrides the URL encoded into the QR code. Set by the ``--public-url``
 #: flag, which cannot be passed through uvicorn's import-string startup.
 _PUBLIC_URL_ENV = "OPENARM_PUBLIC_URL"
@@ -118,14 +121,14 @@ def render_qr_svg(data: str) -> bytes:
     return buffer.getvalue()
 
 
-class OrientationState:
-    """Hold the most recent orientation sample received from a phone."""
+class ArmController:
+    """Track the phone currently driving one arm."""
 
     def __init__(self) -> None:
-        """Start with no samples recorded."""
+        """Start unclaimed, with no samples recorded."""
         self.reading: dict[str, float] | None = None
         self.samples = 0
-        self.clients = 0
+        self.connected = False
 
     def update(self, reading: dict[str, float]) -> None:
         """Record a new sample."""
@@ -133,12 +136,40 @@ class OrientationState:
         self.samples += 1
 
     def snapshot(self) -> dict[str, object]:
-        """Return the current state as a JSON-serialisable mapping."""
+        """Return this arm's state as a JSON-serialisable mapping."""
         return {
             "reading": self.reading,
             "samples": self.samples,
-            "clients": self.clients,
+            "connected": self.connected,
         }
+
+
+class OrientationState:
+    """Hold the latest orientation for every arm of the bimanual model."""
+
+    def __init__(self) -> None:
+        """Create one unclaimed controller per arm."""
+        self.arms = {arm: ArmController() for arm in _ARMS}
+
+    def claim(self, arm: str) -> bool:
+        """Bind an arm to a phone, refusing if another already holds it.
+
+        Two phones fighting over one arm would produce conflicting targets,
+        so the second one is turned away rather than silently interleaved.
+        """
+        controller = self.arms[arm]
+        if controller.connected:
+            return False
+        controller.connected = True
+        return True
+
+    def release(self, arm: str) -> None:
+        """Free an arm when its phone disconnects."""
+        self.arms[arm].connected = False
+
+    def snapshot(self) -> dict[str, object]:
+        """Return every arm's state as a JSON-serialisable mapping."""
+        return {arm: c.snapshot() for arm, c in self.arms.items()}
 
 
 def create_app() -> FastAPI:
@@ -185,34 +216,55 @@ def create_app() -> FastAPI:
     application.state.orientation = state
 
     @application.websocket("/ws")
-    async def orientation_socket(websocket: WebSocket) -> None:
-        """Receive a stream of pitch/roll/yaw frames from a phone."""
+    async def orientation_socket(websocket: WebSocket, arm: str = "left") -> None:
+        """Receive a stream of pitch/roll/yaw frames driving one arm."""
         await websocket.accept()
-        state.clients += 1
-        _logger.info("orientation client connected (%d active)", state.clients)
+
+        if arm not in _ARMS:
+            await websocket.send_json(
+                {"type": "error", "message": f"Unknown arm {arm!r}."}
+            )
+            await websocket.close(code=1008)
+            return
+
+        if not state.claim(arm):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": f"The {arm} arm already has a controller.",
+                }
+            )
+            await websocket.close(code=1008)
+            return
+
+        controller = state.arms[arm]
+        await websocket.send_json({"type": "accepted", "arm": arm})
+        _logger.info("%s arm claimed", arm)
+
         try:
             while True:
                 reading = parse_orientation(await websocket.receive_text())
                 if reading is None:
                     continue
-                state.update(reading)
-                if state.samples % _LOG_EVERY == 0:
+                controller.update(reading)
+                if controller.samples % _LOG_EVERY == 0:
                     _logger.info(
-                        "pitch=%7.1f roll=%7.1f yaw=%7.1f (%d samples)",
+                        "%-5s pitch=%7.1f roll=%7.1f yaw=%7.1f (%d samples)",
+                        arm,
                         reading["pitch"],
                         reading["roll"],
                         reading["yaw"],
-                        state.samples,
+                        controller.samples,
                     )
         except WebSocketDisconnect:
             pass
         finally:
-            state.clients -= 1
-            _logger.info("orientation client left (%d active)", state.clients)
+            state.release(arm)
+            _logger.info("%s arm released", arm)
 
     @application.get("/orientation")
     def orientation() -> dict[str, object]:
-        """Return the most recent orientation sample."""
+        """Return the most recent orientation sample for every arm."""
         return state.snapshot()
 
     @application.get("/health")
