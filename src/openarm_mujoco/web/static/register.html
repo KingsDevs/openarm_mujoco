@@ -184,6 +184,50 @@
             HOLD TO GRIP
           </button>
 
+          <!-- Which phone angle drives which rotation axis. Needed because the
+               device's own x/y swap from the operator's point of view in
+               landscape, so no single fixed convention is right. -->
+          <button
+            id="map-toggle"
+            class="btn btn-sm btn-outline-secondary w-100 mb-2"
+          >
+            Axis mapping &#9662;
+          </button>
+          <div id="map-panel" class="card bg-body-tertiary border-0 mb-3 d-none">
+            <div class="card-body py-3">
+              <div class="btn-group w-100 mb-3" role="group">
+                <button class="btn btn-sm btn-outline-light" data-preset="default">
+                  Portrait
+                </button>
+                <button
+                  class="btn btn-sm btn-outline-light"
+                  data-preset="landscapeLeft"
+                >
+                  Landscape L
+                </button>
+                <button
+                  class="btn btn-sm btn-outline-light"
+                  data-preset="landscapeRight"
+                >
+                  Landscape R
+                </button>
+              </div>
+              <div id="map-rows" class="small"></div>
+
+              <!-- Freeze individual DOF to isolate one axis while debugging. -->
+              <hr class="my-3" />
+              <div class="small text-body-secondary mb-2">
+                Lock drag axes (debug)
+              </div>
+              <div id="drag-locks" class="btn-group w-100" role="group"></div>
+
+              <p class="small text-body-secondary mb-0 mt-3">
+                Mapped &rarr; <span id="mapped" class="reading">—</span>
+              </p>
+              <p id="lock-summary" class="small text-warning mb-0 mt-1 d-none"></p>
+            </div>
+          </div>
+
           <!-- Motion feedback: why the hand is or isn't moving. -->
           <div class="card bg-body-tertiary border-0 mb-3">
             <div class="card-body py-3">
@@ -324,6 +368,130 @@
         $("pitch").textContent = fmt(e.beta);
         $("roll").textContent = fmt(e.gamma);
         $("yaw").textContent = fmt(e.alpha);
+        $("mapped").textContent = mappedAngles()
+          .map((v) => fmt(v))
+          .join("  ");
+      }
+
+      // --- axis mapping --------------------------------------------------
+      // Each slot names the phone angle that drives it, optionally negated.
+      const SLOTS = ["pitch", "roll", "yaw"];
+      const PRESETS = {
+        default: ["pitch", "roll", "yaw"],
+        // Held landscape, the device's x and y swap from the operator's view.
+        // Which of these two is right depends on which way you turn the phone;
+        // if it feels backwards, flip the sign with the +/- buttons.
+        landscapeLeft: ["roll", "-pitch", "yaw"],
+        landscapeRight: ["-roll", "pitch", "yaw"],
+      };
+      const MAP_KEY = `openarm-axes-${arm}`;
+      const LOCK_KEYS = ["pitch", "roll", "yaw", "x", "y", "z"];
+
+      let axes = PRESETS.default.slice();
+      try {
+        const saved = JSON.parse(localStorage.getItem(MAP_KEY) || "null");
+        if (Array.isArray(saved) && saved.length === 3) axes = saved;
+      } catch {
+        /* corrupt or unavailable storage just keeps the default */
+      }
+
+      // Locks are deliberately NOT persisted: a forgotten lock surviving a
+      // reload would look like broken hardware rather than a setting.
+      const locks = Object.fromEntries(LOCK_KEYS.map((k) => [k, false]));
+
+      function mappedAngles() {
+        return axes.map((spec) => {
+          const negate = spec.startsWith("-");
+          const source = negate ? spec.slice(1) : spec;
+          return (negate ? -1 : 1) * (angles[source] ?? 0);
+        });
+      }
+
+      function renderMapRows() {
+        const rows = $("map-rows");
+        rows.innerHTML = "";
+        SLOTS.forEach((slot, i) => {
+          const spec = axes[i];
+          const negate = spec.startsWith("-");
+          const source = negate ? spec.slice(1) : spec;
+
+          const row = document.createElement("div");
+          row.className = "d-flex align-items-center gap-2 mb-2";
+          row.innerHTML = `
+            <span class="text-body-secondary" style="min-width: 5.5rem"
+              >Hand ${slot}</span
+            >
+            <select class="form-select form-select-sm">
+              ${SLOTS.map(
+                (o) =>
+                  `<option value="${o}"${o === source ? " selected" : ""}>${o}</option>`,
+              ).join("")}
+            </select>
+            <button class="btn btn-sm ${negate ? "btn-accent" : "btn-outline-light"}"
+                    style="min-width: 2.8rem">${negate ? "−" : "+"}</button>
+            <button class="btn btn-sm ${locks[slot] ? "btn-warning" : "btn-outline-light"}"
+                    style="min-width: 2.8rem"
+                    title="freeze this axis">${locks[slot] ? "🔒" : "🔓"}</button>`;
+
+          const [invertBtn, lockBtn] = row.querySelectorAll("button");
+          row.querySelector("select").addEventListener("change", (e) => {
+            axes[i] = (negate ? "-" : "") + e.target.value;
+            saveAxes();
+          });
+          invertBtn.addEventListener("click", () => {
+            axes[i] = negate ? source : `-${source}`;
+            saveAxes();
+          });
+          lockBtn.addEventListener("click", () => {
+            locks[slot] = !locks[slot];
+            renderMapRows();
+            renderLocks();
+          });
+          rows.append(row);
+        });
+      }
+
+      function renderLocks() {
+        const group = $("drag-locks");
+        group.innerHTML = "";
+        for (const axis of ["x", "y", "z"]) {
+          const btn = document.createElement("button");
+          btn.className = `btn btn-sm ${locks[axis] ? "btn-warning" : "btn-outline-light"}`;
+          btn.textContent = `${locks[axis] ? "🔒" : "🔓"} ${axis.toUpperCase()}`;
+          btn.addEventListener("click", () => {
+            locks[axis] = !locks[axis];
+            renderLocks();
+          });
+          group.append(btn);
+        }
+
+        const held = LOCK_KEYS.filter((k) => locks[k]);
+        const summary = $("lock-summary");
+        summary.textContent = held.length ? `locked: ${held.join(", ")}` : "";
+        summary.classList.toggle("d-none", held.length === 0);
+      }
+
+      function saveAxes() {
+        try {
+          localStorage.setItem(MAP_KEY, JSON.stringify(axes));
+        } catch {
+          /* private mode: the mapping just will not persist */
+        }
+        renderMapRows();
+      }
+
+      function setupMapping() {
+        $("map-toggle").addEventListener("click", () => {
+          $("map-panel").classList.toggle("d-none");
+        });
+        for (const btn of document.querySelectorAll("[data-preset]")) {
+          btn.addEventListener("click", () => {
+            axes = PRESETS[btn.dataset.preset].slice();
+            saveAxes();
+          });
+        }
+        renderMapRows();
+        renderLocks();
       }
 
       // --- Trackpad: drag to translate -----------------------------------
@@ -428,6 +596,7 @@
       function setupControls() {
         setupPad();
         setupFrameToggle();
+        setupMapping();
         $("rotate").addEventListener("click", () => setRotate(!rotate));
         setRotate(false);
 
@@ -520,6 +689,8 @@
             tz: round(offset.tz),
             epoch: EPOCH,
             frame,
+            axes,
+            locks,
             rotate,
             grip,
           }),

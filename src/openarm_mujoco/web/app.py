@@ -36,6 +36,13 @@ _REGISTER_FILE = _STATIC_ROOT / "register.html"
 _ORIENTATION_FIELDS = ("pitch", "roll", "yaw")
 _TRANSLATION_FIELDS = ("tx", "ty", "tz")
 _FRAMES = ("world", "hand")  # axes a drag is expressed in
+#: Which phone angle may feed each rotation slot. Entries in a mapping are one
+#: of these, optionally prefixed with "-" to invert.
+_AXIS_SOURCES = ("pitch", "roll", "yaw")
+_IDENTITY_AXES = ("pitch", "roll", "yaw")
+#: Individually freezable degrees of freedom, for isolating one axis at a time
+#: while debugging. The first three are rotation slots, the rest drag axes.
+_LOCK_KEYS = ("pitch", "roll", "yaw", "x", "y", "z")
 _MAX_TRAVEL = 100.0  # metres of cumulative drag accepted, as a sanity bound
 _LOG_EVERY = 30
 _TELEMETRY_EVERY = 4  # frames between telemetry replies (~5 Hz at 20 Hz in)
@@ -52,6 +59,39 @@ _QR_MAX_URL_LENGTH = 512
 # Log through uvicorn's own logger so frames appear in the server output
 # without the caller having to configure logging first.
 _logger = logging.getLogger("uvicorn.error")
+
+
+def parse_axes(value: object) -> tuple[str, str, str]:
+    """Validate an axis mapping, falling back to the identity mapping.
+
+    A mapping is three entries -- one per rotation slot -- each naming the phone
+    angle that drives it, optionally negated. One bad entry rejects the whole
+    mapping rather than silently mixing it with the default, which would be
+    harder to diagnose than simply reverting.
+    """
+    if not isinstance(value, list) or len(value) != len(_IDENTITY_AXES):
+        return _IDENTITY_AXES
+
+    entries: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            return _IDENTITY_AXES
+        if entry.removeprefix("-") not in _AXIS_SOURCES:
+            return _IDENTITY_AXES
+        entries.append(entry)
+
+    return (entries[0], entries[1], entries[2])
+
+
+def parse_locks(value: object) -> dict[str, bool]:
+    """Validate the set of frozen degrees of freedom.
+
+    Anything missing or malformed reads as unlocked, so a client that knows
+    nothing about locking still behaves normally.
+    """
+    if not isinstance(value, dict):
+        return dict.fromkeys(_LOCK_KEYS, False)
+    return {key: value.get(key) is True for key in _LOCK_KEYS}
 
 
 def parse_orientation(payload: str) -> dict[str, object] | None:
@@ -100,6 +140,8 @@ def parse_orientation(payload: str) -> dict[str, object] | None:
     # hand currently points. Anything unrecognised falls back to world.
     frame = decoded.get("frame")
     reading["frame"] = frame if frame in _FRAMES else "world"
+    reading["axes"] = parse_axes(decoded.get("axes"))
+    reading["locks"] = parse_locks(decoded.get("locks"))
 
     return reading
 

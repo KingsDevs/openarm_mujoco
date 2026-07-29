@@ -228,6 +228,9 @@ PHONE_POS_SMOOTH = 0.05  # per-tick fraction of pending drag applied
 # Both smoothing constants are per physics tick. At 1 kHz they give roughly a
 # 12-20 ms time constant, enough to hide the 20 Hz staircase of arriving
 # frames without adding lag you can feel.
+PHONE_YAW_OFFSET = -90.0  # deg of yaw between the phone's earth frame and the room
+# Which sign is right depends on which way the operator stands relative to the
+# robot; flip it to +90 if pitching the phone down tilts the hand up.
 
 
 def orientation_quat(pitch: float, roll: float, yaw: float) -> np.ndarray:
@@ -246,6 +249,35 @@ def orientation_quat(pitch: float, roll: float, yaw: float) -> np.ndarray:
             cx * cy * sz + sx * sy * cz,
         ]
     )
+
+
+def yaw_quat(degrees: float) -> np.ndarray:
+    """Return a rotation of `degrees` about the world's z axis."""
+    quat = np.zeros(4)
+    mujoco.mju_axisAngle2Quat(quat, np.array([0.0, 0.0, 1.0]), np.radians(degrees))
+    return quat
+
+
+ROOM_FROM_PHONE = yaw_quat(PHONE_YAW_OFFSET)
+PHONE_FROM_ROOM = np.zeros(4)
+mujoco.mju_negQuat(PHONE_FROM_ROOM, ROOM_FROM_PHONE)
+
+
+def to_room(rotation: np.ndarray) -> np.ndarray:
+    """Re-express a rotation from the phone's earth frame in the room's frame.
+
+    DeviceOrientation's beta turns about the earth's **x** axis, and at the home
+    pose this model's approach axis lies along the room's **+x** -- so feeding
+    beta straight through rotates the gripper about the very axis it points
+    down, and pitching the phone moves the approach arrow not at all. The two
+    frames differ by a yaw, so conjugating by it sends phone pitch to a room-y
+    rotation, which is the one that tilts the hand up and down. Yaw is about z
+    either way and so passes through this untouched.
+    """
+    turned, out = np.zeros(4), np.zeros(4)
+    mujoco.mju_mulQuat(turned, ROOM_FROM_PHONE, rotation)
+    mujoco.mju_mulQuat(out, turned, PHONE_FROM_ROOM)
+    return out
 
 
 def hand_basis(quat: np.ndarray) -> np.ndarray:
@@ -281,6 +313,23 @@ def direction_frame(direction: np.ndarray) -> np.ndarray:
     first = np.cross(helper, direction)
     first /= np.linalg.norm(first)
     return np.column_stack([first, np.cross(direction, first), direction])
+
+
+DEFAULT_AXES = ("pitch", "roll", "yaw")
+
+
+def remap_angles(reading) -> tuple[float, float, float]:
+    """Apply the operator's axis mapping to the raw phone angles.
+
+    Which phone axis reads as "pitch" depends on how the handset is held -- in
+    landscape the device's x and y axes swap from the operator's point of view --
+    so the mapping is chosen on the phone rather than assumed here.
+    """
+    values = []
+    for spec in reading.get("axes", DEFAULT_AXES):
+        source = spec.removeprefix("-")
+        values.append((-1.0 if spec.startswith("-") else 1.0) * reading[source])
+    return values[0], values[1], values[2]
 
 
 def shrink_quat(rotation: np.ndarray, deadband_rad: float) -> np.ndarray:
@@ -338,9 +387,17 @@ class PhoneDriver:
         self.epoch = None  # page load the running total belongs to
         self.pending = np.zeros(3)  # drag not yet fed to the target
         self.ref = None  # phone attitude latched when ROTATE engaged
+        self.ref_angles = (0.0, 0.0, 0.0)  # mapped angles at that latch
+        self.axes = None  # axis mapping the latched reference was built under
         self.smoothed = data.mocap_quat[arm_ik.mocap].copy()
         self.prev_hand = data.site_xpos[arm_ik.site].copy()
         self.speed = 0.0
+
+    @staticmethod
+    def drag_mask(reading) -> np.ndarray:
+        """Return a 0/1 mask zeroing the drag axes the operator has locked."""
+        locks = reading.get("locks", {})
+        return np.array([0.0 if locks.get(axis) else 1.0 for axis in "xyz"])
 
     def apply(self, reading, dt):
         """Advance this arm's target from the latest phone frame."""
@@ -363,6 +420,10 @@ class PhoneDriver:
         delta = offset - self.last_offset
         self.last_offset = offset
         if np.linalg.norm(delta) <= PHONE_MAX_STEP:
+            # Locked drag axes are zeroed on input, not output, so a lock means
+            # the same thing in either frame. `last_offset` still advances, so
+            # unlocking later does not release a backlog of banked motion.
+            delta = delta * self.drag_mask(reading)
             # Rotate into world immediately, so `pending` is always world-frame
             # and toggling frames mid-drag cannot mix conventions.
             if reading["frame"] == "hand":
@@ -381,26 +442,50 @@ class PhoneDriver:
             self.pending[:] = 0.0  # stop banking drag we will never apply
         self.d.mocap_pos[self.ik.mocap] = moved
 
-        # --- rotation, only while ROTATE is held ------------------------
+        # --- rotation, only while ROTATE is on --------------------------
         if reading["rotate"]:
-            now = orientation_quat(
-                reading["pitch"], reading["roll"], reading["yaw"]
-            )
-            
+            # Remapping mid-session invalidates the latched reference, which was
+            # built under the old convention; re-latch so the hand does not jump.
+            axes = tuple(reading.get("axes", DEFAULT_AXES))
+            if self.axes != axes:
+                self.axes = axes
+                self.ref = None
+
+            current = remap_angles(reading)
             if self.ref is None:
                 # Latch, so the hand never snaps to the phone's absolute
                 # attitude and yaw drift resets on every press.
-                self.ref = now
+                self.ref_angles = current
+                self.ref = orientation_quat(*current)
                 self.hand = self.d.mocap_quat[self.ik.mocap].copy()
                 self.smoothed = self.hand.copy()
             else:
+                # A locked slot keeps reporting its latched angle, so it
+                # contributes no rotation while the others stay live.
+                locks = reading.get("locks", {})
+                now = orientation_quat(
+                    *(
+                        self.ref_angles[i] if locks.get(name) else current[i]
+                        for i, name in enumerate(DEFAULT_AXES)
+                    )
+                )
+                # Both quats are attitudes in the earth frame, so `now * ref^-1`
+                # is the rotation since latch expressed in that frame, and
+                # pre-multiplying applies it globally. The other pairing
+                # (`ref^-1 * now`, post-multiplied) applies it in the hand's own
+                # frame, which is rotated ~90 deg from the room: phone pitch
+                # then swivels the gripper horizontally and phone yaw rolls it
+                # about its approach axis. Global is what matches the operator.
+                # `to_room` then carries the earth frame onto the room's axes;
+                # without it phone pitch lands on the approach axis and does
+                # nothing visible.
                 inverse, delta, target = np.zeros(4), np.zeros(4), np.zeros(4)
                 mujoco.mju_negQuat(inverse, self.ref)
-                mujoco.mju_mulQuat(delta, inverse, now)
+                mujoco.mju_mulQuat(delta, now, inverse)
                 mujoco.mju_mulQuat(
                     target,
+                    to_room(shrink_quat(delta, np.radians(PHONE_ROT_DEADBAND))),
                     self.hand,
-                    shrink_quat(delta, np.radians(PHONE_ROT_DEADBAND)),
                 )
                 self.smoothed = blend_quat(
                     self.smoothed, target, PHONE_ROT_SMOOTH
