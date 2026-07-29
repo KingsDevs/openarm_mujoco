@@ -20,10 +20,15 @@ Controls (keyboard, if Ctrl+right-drag is awkward on your pointer):
   space        pause physics
 
 Controls (phones, with --phone):
-  Two phones, one per hand. Scan the QR for an arm, allow motion access, then
-  hold HOLD TO CONTROL. While held, rotating the phone rotates that hand and
-  tilting past the deadzone moves it; up/down buttons raise and lower it, and
-  Gripper toggles the jaws. Releasing freezes the hand where it is.
+  Two phones, one per hand; each page is tinted to match its target sphere.
+  Translation and rotation are separate gestures, so neither disturbs the other:
+    drag on the pad     -> move the hand (one finger x/y, two fingers z)
+    ROTATE toggle       -> tilt turns the hand, relative to the attitude at the
+                           tap; dragging stays live, so you can do both at once
+    Hand / World toggle -> whether "forward" follows the gripper or the room
+    HOLD TO GRIP        -> squeeze the jaws, release to open
+  Each target carries a long arrow along its approach axis and a short one on
+  the hand's up axis, so orientation and roll are both visible while driving.
 """
 
 import argparse
@@ -37,18 +42,29 @@ import numpy as np
 import openarm_mujoco.v2 as openarm_mujoco
 
 ARMS = ("left", "right")
-DAMPING = 1e-4  # DLS regularisation
-GAIN = 0.6  # fraction of the DLS step taken per tick
+# Per-arm target colours. The phone pages tint themselves to match, so it is
+# obvious at a glance which handset drives which hand.
+TARGET_COLORS = ([0.2, 0.5, 1.0, 0.45], [1.0, 0.35, 0.15, 0.45])
+DAMPING = 1e-4  # baseline DLS regularisation
+SIGMA_EPS = 0.08  # smallest singular value below which damping ramps up
+LAMBDA_MAX = 0.05  # extra damping at a full singularity
+ERR_CLAMP = 0.03  # m of position error fed to the solver per tick
+ROT_CLAMP = 0.20  # rad of orientation error fed to the solver per tick
+NULL_GAIN = 0.01  # pull of the redundant DoF back to the rest posture
+GAIN = 0.10  # per-tick loop gain; this is kp*dt, so ~0.1 at 1 kHz.
+# Larger values (0.6 was the first guess) drive dq into the MAX_DQ clip every
+# tick and the arm bang-bangs -- that reads as IK shakiness.
 MAX_DQ = 0.03  # rad per IK iteration, per joint
 IK_ITERS = 1  # IK iterations per physics tick (1 kHz already over-iterates)
 JOG_STEP = 0.01  # metres per keyboard jog press
+FRAME_HZ = 60  # render rate; physics steps in a burst between frames
 POS_W, ROT_W = 1.0, 0.35  # weight position over orientation
 
 
 def build(scene: str):
     """Compile the scene with one mocap target per hand."""
     spec = mujoco.MjSpec.from_file(scene)
-    for arm, rgba in zip(ARMS, ([0.2, 0.5, 1.0, 0.45], [1.0, 0.35, 0.15, 0.45])):
+    for arm, rgba in zip(ARMS, TARGET_COLORS):
         body = spec.worldbody.add_body(name=f"target_{arm}", mocap=True)
         # The EE site sits exactly on ee_base_link's origin, i.e. inside the
         # gripper mesh, so a small marker is invisible. A translucent sphere
@@ -106,6 +122,7 @@ class ArmIK:
         self.closed = False
 
         self.q_cmd = data.qpos[self.qadr].copy()
+        self.q_rest = self.q_cmd.copy()
         self._jacp = np.zeros((3, model.nv))
         self._jacr = np.zeros((3, model.nv))
 
@@ -139,14 +156,49 @@ class ArmIK:
             err[:3] = (d.mocap_pos[self.mocap] - ghost.site_xpos[self.site]) * POS_W
             cur = np.zeros(4)
             mujoco.mju_mat2Quat(cur, ghost.site_xmat[self.site])
-            mujoco.mju_subQuat(err[3:], d.mocap_quat[self.mocap], cur)
+            # mju_subQuat returns the error in the CURRENT BODY frame
+            # (qb*quat(res) = qa), but mj_jacSite's rotational block is in the
+            # world frame. Rotate it out; at the home pose the two differ by
+            # 90 degrees, so feeding it raw drives rotation sideways and the
+            # hand oscillates instead of converging.
+            rot_err = np.zeros(3)
+            mujoco.mju_subQuat(rot_err, d.mocap_quat[self.mocap], cur)
+            err[3:] = ghost.site_xmat[self.site].reshape(3, 3) @ rot_err
             err[3:] *= ROT_W
             if np.linalg.norm(err) < 1e-6:
                 break
 
+            # Cap how far the solver is asked to travel in one tick. A fast
+            # drag would otherwise request a metre-scale step and saturate the
+            # per-joint clip, which reads as thrashing.
+            pn = np.linalg.norm(err[:3])
+            if pn > ERR_CLAMP:
+                err[:3] *= ERR_CLAMP / pn
+            rn = np.linalg.norm(err[3:])
+            if rn > ROT_CLAMP:
+                err[3:] *= ROT_CLAMP / rn
+
             mujoco.mj_jacSite(m, ghost, self._jacp, self._jacr, self.site)
             jac = np.vstack([self._jacp[:, self.dofs], self._jacr[:, self.dofs]])
-            dq = jac.T @ np.linalg.solve(jac @ jac.T + DAMPING * np.eye(6), err)
+
+            # Adaptive damping. Fixed small lambda amplifies near-singular
+            # directions without bound; this arm's smallest singular value
+            # falls from ~0.13 to ~0 as it extends, so lambda has to grow as
+            # the configuration degenerates.
+            sigma_min = np.linalg.svd(jac, compute_uv=False)[-1]
+            lam = DAMPING
+            if sigma_min < SIGMA_EPS:
+                lam += LAMBDA_MAX * (1.0 - (sigma_min / SIGMA_EPS) ** 2)
+
+            dq = jac.T @ np.linalg.solve(jac @ jac.T + lam * np.eye(6), err)
+
+            # Null-space term: bleed the redundant 7th DoF back toward the
+            # rest posture so it does not wander into limits over time.
+            null = np.eye(7) - jac.T @ np.linalg.solve(
+                jac @ jac.T + lam * np.eye(6), jac
+            )
+            dq += null @ (NULL_GAIN * (self.q_rest - self.q_cmd))
+
             self.q_cmd = np.clip(
                 self.q_cmd + np.clip(GAIN * dq, -MAX_DQ, MAX_DQ), self.lo, self.hi
             )
@@ -161,13 +213,21 @@ class ArmIK:
 # drive. Motion is relative to the pose held when the clutch engaged, so the
 # hand never snaps to the phone's absolute attitude and gyro yaw drift is
 # reset on every press instead of accumulating.
-PHONE_DEADZONE = 12.0  # deg of tilt before the hand starts translating
-PHONE_TILT_SPAN = 45.0  # deg beyond the deadzone that maps to full speed
-PHONE_SPEED = 0.30  # m/s at full tilt
-PHONE_LIFT_SPEED = 0.20  # m/s while up/down is held
-PHONE_SIGN_X = -1.0  # flip if tilting away drives the hand backwards
-PHONE_SIGN_Y = -1.0
 PHONE_MAX_REACH = 0.9  # m the target may stray from where it started
+PHONE_MAX_STEP = 0.15  # m of drag accepted in one frame before assuming a reset
+# At 20 Hz, 0.15 m per frame is 3 m/s of thumb travel -- far beyond a real
+# drag, so anything larger means the phone's running total restarted (page
+# reload, new tab) rather than that the operator moved.
+PHONE_ROT_SMOOTH = 0.08  # per-tick blend toward the phone's attitude
+PHONE_ROT_DEADBAND = 3.0  # deg of wrist wobble ignored while ROTATE is on
+# With drag and rotate live at once, the small tilt your hand makes while
+# thumbing the trackpad would otherwise turn the gripper. The deadband is
+# subtracted continuously rather than gated, so crossing it does not jump;
+# set it to 0 for a strict 1:1 mapping.
+PHONE_POS_SMOOTH = 0.05  # per-tick fraction of pending drag applied
+# Both smoothing constants are per physics tick. At 1 kHz they give roughly a
+# 12-20 ms time constant, enough to hide the 20 Hz staircase of arriving
+# frames without adding lag you can feel.
 
 
 def orientation_quat(pitch: float, roll: float, yaw: float) -> np.ndarray:
@@ -188,66 +248,223 @@ def orientation_quat(pitch: float, roll: float, yaw: float) -> np.ndarray:
     )
 
 
-def tilt_velocity(delta: float) -> float:
-    """Map tilt past the deadzone onto a speed, ramping to PHONE_SPEED."""
-    magnitude = abs(delta) - PHONE_DEADZONE
-    if magnitude <= 0.0:
-        return 0.0
-    return np.sign(delta) * PHONE_SPEED * min(magnitude / PHONE_TILT_SPAN, 1.0)
+def hand_basis(quat: np.ndarray) -> np.ndarray:
+    """Return the hand's (forward, left, up) axes as matrix columns.
+
+    Forward is the approach axis, which for this model's ee_control_point site
+    is local **-z**: the fingers lie along -z, so +z points back into the wrist.
+    Left and up are then chosen to keep up as close to world up as possible, so
+    at the home pose this basis coincides with the world axes and switching
+    frames there changes nothing.
+    """
+    mat = np.zeros(9)
+    mujoco.mju_quat2Mat(mat, quat)
+    forward = -mat.reshape(3, 3)[:, 2]
+
+    reference = np.array([0.0, 0.0, 1.0])
+    left = np.cross(reference, forward)
+    if np.linalg.norm(left) < 1e-6:
+        # Pointing straight up or down leaves the heading undefined; fall back
+        # to the world x axis so the basis stays well conditioned.
+        left = np.cross(np.array([1.0, 0.0, 0.0]), forward)
+    left /= np.linalg.norm(left)
+
+    return np.column_stack([forward, left, np.cross(forward, left)])
+
+
+def direction_frame(direction: np.ndarray) -> np.ndarray:
+    """Build a rotation whose local +z is `direction`, for mjv arrow geoms."""
+    direction = direction / np.linalg.norm(direction)
+    helper = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(helper, direction)) > 0.99:
+        helper = np.array([1.0, 0.0, 0.0])
+    first = np.cross(helper, direction)
+    first /= np.linalg.norm(first)
+    return np.column_stack([first, np.cross(direction, first), direction])
+
+
+def shrink_quat(rotation: np.ndarray, deadband_rad: float) -> np.ndarray:
+    """Reduce a rotation's angle by `deadband_rad`, keeping its axis.
+
+    Subtracting rather than gating keeps the mapping continuous: a wobble just
+    past the deadband produces a tiny rotation instead of snapping to the full
+    angle, which is what a plain threshold would do.
+    """
+    if deadband_rad <= 0.0:
+        return rotation
+
+    # Take the short arc, so a sign-flipped quaternion is not read as ~360 deg.
+    signed = rotation if rotation[0] >= 0.0 else -rotation
+    angle = 2.0 * np.arccos(np.clip(signed[0], -1.0, 1.0))
+    if angle <= deadband_rad:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+
+    axis = signed[1:]
+    if (norm := np.linalg.norm(axis)) < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+
+    reduced = np.zeros(4)
+    mujoco.mju_axisAngle2Quat(reduced, axis / norm, angle - deadband_rad)
+    return reduced
+
+
+def blend_quat(current: np.ndarray, target: np.ndarray, alpha: float) -> np.ndarray:
+    """Blend toward `target` along the short arc, renormalising the result.
+
+    Negating an antipodal target first keeps the blend on the short way round;
+    without it a sign flip in the phone's attitude spins the hand the long way.
+    """
+    if np.dot(current, target) < 0.0:
+        target = -target
+    blended = (1.0 - alpha) * current + alpha * target
+    return blended / np.linalg.norm(blended)
 
 
 class PhoneDriver:
-    """Steer one arm's mocap target from that arm's phone."""
+    """Steer one arm's mocap target from that arm's phone.
 
-    def __init__(self, arm_ik, data):
+    Translation and rotation are deliberately separate: dragging on the phone
+    moves the hand and never turns it, holding ROTATE turns the hand and never
+    moves it. Neither path integrates acceleration, so a phone left untouched
+    leaves the target exactly where it was.
+    """
+
+    def __init__(self, arm_ik, data, controller=None):
         self.ik = arm_ik
         self.d = data
+        self.controller = controller
         self.home = data.mocap_pos[arm_ik.mocap].copy()
-        self.ref = None  # phone attitude latched at engage
-
-    def _engage(self, reading):
-        """Latch the phone and hand poses so motion is relative to them."""
-        self.ref = orientation_quat(
-            reading["pitch"], reading["roll"], reading["yaw"]
-        )
-        self.ref_pitch = reading["pitch"]
-        self.ref_roll = reading["roll"]
-        self.hand = self.d.mocap_quat[self.ik.mocap].copy()
+        self.last_offset = None  # cumulative drag already consumed
+        self.epoch = None  # page load the running total belongs to
+        self.pending = np.zeros(3)  # drag not yet fed to the target
+        self.ref = None  # phone attitude latched when ROTATE engaged
+        self.smoothed = data.mocap_quat[arm_ik.mocap].copy()
+        self.prev_hand = data.site_xpos[arm_ik.site].copy()
+        self.speed = 0.0
 
     def apply(self, reading, dt):
         """Advance this arm's target from the latest phone frame."""
-        if reading is None or not reading.get("engaged"):
-            self.ref = None  # next press re-latches from wherever we stopped
+        if reading is None:
+            self.last_offset = None
+            self.ref = None
             return
-        if self.ref is None:
-            self._engage(reading)
-            return  # first engaged frame only calibrates; no motion
 
-        # Orientation: apply the rotation accumulated since engage.
-        now = orientation_quat(reading["pitch"], reading["roll"], reading["yaw"])
-        inverse, delta, target = np.zeros(4), np.zeros(4), np.zeros(4)
-        mujoco.mju_negQuat(inverse, self.ref)
-        mujoco.mju_mulQuat(delta, inverse, now)
-        mujoco.mju_mulQuat(target, self.hand, delta)
-        self.d.mocap_quat[self.ik.mocap] = target
+        # --- translation ------------------------------------------------
+        # The phone sends a running total, so re-reading an unchanged frame
+        # contributes nothing; only genuine movement produces a delta.
+        offset = np.array([reading["tx"], reading["ty"], reading["tz"]])
+        # A reloaded page restarts its running total at zero, which would read
+        # as one large drag back to the origin. Re-baseline on a new epoch
+        # rather than lurching; the magnitude guard then only has to catch
+        # corrupt frames, which no threshold could distinguish from a reload.
+        if self.epoch != reading["epoch"] or self.last_offset is None:
+            self.epoch = reading["epoch"]
+            self.last_offset = offset
+        delta = offset - self.last_offset
+        self.last_offset = offset
+        if np.linalg.norm(delta) <= PHONE_MAX_STEP:
+            # Rotate into world immediately, so `pending` is always world-frame
+            # and toggling frames mid-drag cannot mix conventions.
+            if reading["frame"] == "hand":
+                delta = hand_basis(self.d.mocap_quat[self.ik.mocap]) @ delta
+            self.pending += delta
 
-        # Position: tilt past the deadzone becomes velocity; buttons do z.
-        step = np.array(
-            [
-                PHONE_SIGN_X * tilt_velocity(reading["pitch"] - self.ref_pitch),
-                PHONE_SIGN_Y * tilt_velocity(reading["roll"] - self.ref_roll),
-                PHONE_LIFT_SPEED * float(reading.get("lift", 0)),
-            ]
-        )
-        moved = self.d.mocap_pos[self.ik.mocap] + step * dt
+        step = self.pending * PHONE_POS_SMOOTH
+        self.pending -= step
+        moved = self.d.mocap_pos[self.ik.mocap] + step
+
         # Keep a runaway target inside reach instead of dragging the arm to
         # its limits and leaving the IK stuck against them.
-        offset = moved - self.home
-        if (norm := np.linalg.norm(offset)) > PHONE_MAX_REACH:
-            moved = self.home + offset * (PHONE_MAX_REACH / norm)
+        reach = moved - self.home
+        if (norm := np.linalg.norm(reach)) > PHONE_MAX_REACH:
+            moved = self.home + reach * (PHONE_MAX_REACH / norm)
+            self.pending[:] = 0.0  # stop banking drag we will never apply
         self.d.mocap_pos[self.ik.mocap] = moved
 
-        self.ik.closed = bool(reading.get("grip"))
+        # --- rotation, only while ROTATE is held ------------------------
+        if reading["rotate"]:
+            now = orientation_quat(
+                reading["pitch"], reading["roll"], reading["yaw"]
+            )
+            
+            if self.ref is None:
+                # Latch, so the hand never snaps to the phone's absolute
+                # attitude and yaw drift resets on every press.
+                self.ref = now
+                self.hand = self.d.mocap_quat[self.ik.mocap].copy()
+                self.smoothed = self.hand.copy()
+            else:
+                inverse, delta, target = np.zeros(4), np.zeros(4), np.zeros(4)
+                mujoco.mju_negQuat(inverse, self.ref)
+                mujoco.mju_mulQuat(delta, inverse, now)
+                mujoco.mju_mulQuat(
+                    target,
+                    self.hand,
+                    shrink_quat(delta, np.radians(PHONE_ROT_DEADBAND)),
+                )
+                self.smoothed = blend_quat(
+                    self.smoothed, target, PHONE_ROT_SMOOTH
+                )
+                self.d.mocap_quat[self.ik.mocap] = self.smoothed
+
+            # print the rotation of the sphere in the world frame, so the operator can see how the hand is turning
+            print(f"{self.ik.arm} hand: pitch={reading['pitch']:.1f} roll={reading['roll']:.1f} yaw={reading['yaw']:.1f}")
+        else:
+            self.ref = None
+
+        self.ik.closed = bool(reading["grip"])
+        self._report(dt)
+
+    def _report(self, dt):
+        """Publish hand speed and reach back to the phone."""
+        if self.controller is None:
+            return
+        hand = self.d.site_xpos[self.ik.site]
+        instant = float(np.linalg.norm(hand - self.prev_hand) / dt)
+        self.prev_hand = hand.copy()
+        # Heavily smoothed: a per-tick difference at 1 kHz is mostly noise.
+        self.speed += 0.002 * (instant - self.speed)
+        self.controller.telemetry = {
+            "speed": round(self.speed, 3),
+            "reach": round(
+                float(np.linalg.norm(self.d.mocap_pos[self.ik.mocap] - self.home)), 3
+            ),
+            "limit": PHONE_MAX_REACH,
+        }
+
+
+def draw_target_frames(viewer, arms):
+    """Draw an arrow per target showing where that hand is pointing.
+
+    Model geoms cannot be arrows -- mjGEOM_ARROW is visualisation-only -- so
+    these go into the viewer's user scene each frame instead of into the MJCF.
+    The long arrow is the approach axis, i.e. where the gripper actually points
+    (local -z for this model's site). The short one marks the hand's "up", which
+    is what makes roll readable rather than ambiguous.
+    """
+    scene = viewer.user_scn
+    scene.ngeom = 0
+
+    for arm_ik, colour in zip(arms, TARGET_COLORS):
+        basis = hand_basis(arm_ik.d.mocap_quat[arm_ik.mocap])
+        arrows = (
+            (basis[:, 0], [0.010, 0.010, 0.16], 1.00),  # forward / approach
+            (basis[:, 2], [0.006, 0.006, 0.07], 0.55),  # hand up, shows roll
+        )
+        for direction, size, shade in arrows:
+            if scene.ngeom >= scene.maxgeom:
+                return
+            rgba = np.array([*(np.array(colour[:3]) * shade), 0.9])
+            mujoco.mjv_initGeom(
+                scene.geoms[scene.ngeom],
+                mujoco.mjtGeom.mjGEOM_ARROW,
+                np.array(size),
+                arm_ik.d.mocap_pos[arm_ik.mocap].copy(),
+                # mjv arrows point along the geom's local z.
+                direction_frame(direction).flatten(),
+                rgba.astype(np.float32),
+            )
+            scene.ngeom += 1
 
 
 def serve_phones(host: str, port: int):
@@ -277,7 +494,7 @@ def serve_phones(host: str, port: int):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("xml", nargs="?", default=openarm_mujoco.openarm_pedestal_xml())
+    ap.add_argument("xml", nargs="?", default=openarm_mujoco.openarm_cell_xml())
     ap.add_argument("--keyframe", "-k", default="home")
     ap.add_argument(
         "--phone",
@@ -340,7 +557,10 @@ def main() -> int:
 
     orientation = serve_phones(args.phone_host, args.phone_port) if args.phone else None
     drivers = (
-        {arm: PhoneDriver(ik, data) for arm, ik in zip(ARMS, arms)}
+        {
+            arm: PhoneDriver(ik, data, orientation.arms[arm])
+            for arm, ik in zip(ARMS, arms)
+        }
         if orientation
         else {}
     )
@@ -349,20 +569,28 @@ def main() -> int:
     with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as v:
         v.cam.lookat[:] = model.stat.center
         v.cam.distance = model.stat.extent * 1.2
+        # v.sync() costs ~5.7 ms against a 0.19 ms physics step, so syncing
+        # once per step pins the loop at ~164 Hz and the sim crawls at 0.16x
+        # realtime with several ms of frame jitter -- which looks like shake.
+        # Render at FRAME_HZ and advance the physics in a burst between frames.
+        steps_per_frame = max(1, round((1.0 / FRAME_HZ) / model.opt.timestep))
+        frame_dt = steps_per_frame * model.opt.timestep
         while v.is_running():
             t0 = time.time()
             # launch_passive only RECORDS Ctrl+drag into v.perturb; unlike the
             # managed viewer it never applies it, so without this call the
-            # target cubes select but never move.
+            # target spheres select but never move.
             mujoco.mjv_applyPerturbPose(model, data, v.perturb, 0)
             if not paused[0]:
-                for arm, driver in drivers.items():
-                    driver.apply(orientation.arms[arm].reading, model.opt.timestep)
-                for a in arms:
-                    a.step(ghost)
-                mujoco.mj_step(model, data)
+                for _ in range(steps_per_frame):
+                    for arm, driver in drivers.items():
+                        driver.apply(orientation.arms[arm].reading, model.opt.timestep)
+                    for a in arms:
+                        a.step(ghost)
+                    mujoco.mj_step(model, data)
+            draw_target_frames(v, arms)
             v.sync()
-            time.sleep(max(0, model.opt.timestep - (time.time() - t0)))
+            time.sleep(max(0, frame_dt - (time.time() - t0)))
     return 0
 
 

@@ -34,7 +34,11 @@ _INDEX_FILE = _STATIC_ROOT / "index.html"
 _REGISTER_FILE = _STATIC_ROOT / "register.html"
 
 _ORIENTATION_FIELDS = ("pitch", "roll", "yaw")
+_TRANSLATION_FIELDS = ("tx", "ty", "tz")
+_FRAMES = ("world", "hand")  # axes a drag is expressed in
+_MAX_TRAVEL = 100.0  # metres of cumulative drag accepted, as a sanity bound
 _LOG_EVERY = 30
+_TELEMETRY_EVERY = 4  # frames between telemetry replies (~5 Hz at 20 Hz in)
 
 #: One controlling phone per arm of the bimanual model.
 _ARMS = ("left", "right")
@@ -72,13 +76,30 @@ def parse_orientation(payload: str) -> dict[str, object] | None:
             return None
         reading[field] = float(value)
 
-    reading["engaged"] = decoded.get("engaged") is True
+    reading["rotate"] = decoded.get("rotate") is True
     reading["grip"] = decoded.get("grip") is True
 
-    lift = decoded.get("lift")
-    if isinstance(lift, bool) or not isinstance(lift, (int, float)):
-        lift = 0
-    reading["lift"] = max(-1, min(1, int(lift)))
+    # Translation arrives as a running total in metres rather than a per-frame
+    # delta, so the teleop loop can read the same frame repeatedly -- at 1 kHz
+    # against a 20 Hz stream it will -- without applying the motion twice.
+    for axis in _TRANSLATION_FIELDS:
+        value = decoded.get(axis)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            value = 0.0
+        reading[axis] = max(-_MAX_TRAVEL, min(_MAX_TRAVEL, float(value)))
+
+    # Identifies one page load. A reload restarts the running total at zero,
+    # which is indistinguishable from a drag back to the origin unless the
+    # client tells us it is a new session.
+    epoch = decoded.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        epoch = 0
+    reading["epoch"] = int(epoch)
+
+    # Which axes the drag is expressed in: world, or relative to where the
+    # hand currently points. Anything unrecognised falls back to world.
+    frame = decoded.get("frame")
+    reading["frame"] = frame if frame in _FRAMES else "world"
 
     return reading
 
@@ -138,6 +159,9 @@ class ArmController:
         self.reading: dict[str, object] | None = None
         self.samples = 0
         self.connected = False
+        #: Written by the teleop loop when one is running, echoed back to the
+        #: phone so the operator can see hand speed and remaining reach.
+        self.telemetry: dict[str, float] | None = None
 
     def update(self, reading: dict[str, object]) -> None:
         """Record a new sample.
@@ -260,6 +284,11 @@ def create_app() -> FastAPI:
                 if reading is None:
                     continue
                 controller.update(reading)
+
+                telemetry = controller.telemetry
+                if telemetry and controller.samples % _TELEMETRY_EVERY == 0:
+                    await websocket.send_json({"type": "telemetry", **telemetry})
+
                 if controller.samples % _LOG_EVERY == 0:
                     _logger.info(
                         "%-5s pitch=%7.1f roll=%7.1f yaw=%7.1f (%d samples)",

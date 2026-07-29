@@ -11,19 +11,19 @@
       crossorigin="anonymous"
     />
     <style>
+      :root {
+        /* Overwritten per arm to match that hand's target sphere in MuJoCo. */
+        --accent: #0d6efd;
+      }
       body {
         min-height: 100vh;
         background:
           radial-gradient(
-            circle at 20% 20%,
-            rgba(13, 110, 253, 0.18),
+            circle at 20% 15%,
+            color-mix(in srgb, var(--accent) 22%, transparent),
             transparent 55%
           ),
-          radial-gradient(
-            circle at 80% 60%,
-            rgba(102, 16, 242, 0.15),
-            transparent 50%
-          );
+          radial-gradient(circle at 80% 60%, rgba(102, 16, 242, 0.12), transparent 50%);
       }
       .reading {
         font-variant-numeric: tabular-nums;
@@ -38,16 +38,68 @@
         -webkit-user-select: none;
         -webkit-touch-callout: none;
       }
+      .btn-accent {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      .btn-accent:active,
+      .btn-accent.on {
+        filter: brightness(1.35);
+        color: #fff;
+      }
+      /* The trackpad. Large, because it is the primary control. */
+      #pad {
+        position: relative;
+        height: 42vh;
+        min-height: 220px;
+        border: 2px dashed rgba(255, 255, 255, 0.25);
+        border-radius: 1rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        color: var(--bs-secondary-color);
+        transition: border-color 0.1s, background 0.1s;
+      }
+      #pad.active {
+        border-color: var(--accent);
+        border-style: solid;
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+      }
+      #pad-dot {
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--accent);
+        opacity: 0;
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+      #pad.active #pad-dot {
+        opacity: 0.9;
+      }
+      /* ROTATE mode parks the trackpad: tilting your hand while dragging would
+         otherwise turn the hand by accident. */
+      #pad.inert {
+        opacity: 0.4;
+        pointer-events: none;
+        border-style: dotted;
+      }
+      .meter {
+        height: 6px;
+      }
     </style>
   </head>
   <body>
-    <div class="container py-5" style="max-width: 640px">
+    <div class="container py-4" style="max-width: 640px">
       <a href="/" class="text-decoration-none text-body-secondary small"
         >&larr; Back</a
       >
       <div class="d-flex align-items-center gap-2 mt-3 mb-4">
-        <h1 class="h2 fw-bold mb-0">Register device</h1>
-        <span id="arm-badge" class="badge text-bg-primary d-none"></span>
+        <h1 class="h3 fw-bold mb-0">Register device</h1>
+        <span id="arm-badge" class="badge btn-accent d-none"></span>
       </div>
 
       <!-- Shown only when the link carried no ?arm=, e.g. typed by hand. -->
@@ -60,7 +112,7 @@
       </div>
 
       <!-- Step 1: is this a phone? -->
-      <div class="card bg-body-tertiary border-0 mb-4">
+      <div id="check-card" class="card bg-body-tertiary border-0 mb-4">
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between mb-3">
             <h2 class="h6 mb-0">Device check</h2>
@@ -80,88 +132,114 @@
       </div>
 
       <div id="insecure" class="alert alert-danger d-none">
-        <strong>Insecure connection.</strong> Motion sensors require HTTPS.
-        This page is served over <code id="insecure-origin"></code>, so the
-        browser will block the IMU. Serve the app with TLS and reload over
-        <code>https://</code>.
+        <strong>Insecure connection.</strong> Motion sensors require HTTPS. This
+        page is served over <code id="insecure-origin"></code>, so the browser
+        will block the IMU.
       </div>
 
-      <!-- Step 2: permission + live orientation -->
+      <!-- Step 2: permission, then the controls -->
       <div id="imu-section" class="d-none">
-        <button id="enable" class="btn btn-primary w-100 mb-4">
+        <button id="enable" class="btn btn-accent btn-lg w-100 mb-4">
           Enable motion sensors
         </button>
 
         <div id="perm-error" class="alert alert-danger d-none"></div>
 
-        <!-- Clutch: the arm only moves while this is held, so putting the
-             phone down freezes the hand instead of flinging it. -->
-        <div id="controls" class="d-none mb-4">
-          <button
-            id="clutch"
-            class="btn btn-success btn-lg w-100 py-4 mb-3 hold fw-semibold"
-          >
-            HOLD TO CONTROL
+        <div id="controls" class="d-none">
+          <!-- A latching toggle rather than a hold, so a thumb stays free for
+               the trackpad. Both can be live at once; the teleop side applies a
+               small deadband so wobble while dragging does not turn the hand. -->
+          <button id="rotate" class="btn btn-outline-light w-100 py-3 mb-3 fw-semibold">
+            ROTATE: OFF
           </button>
-          <div class="d-flex gap-2 mb-2">
-            <button id="lift-up" class="btn btn-outline-light flex-fill hold">
-              &#9650; up
+
+          <!-- Translation. Self-clutched: the hand only moves while a finger
+               is down. Stays live regardless of the ROTATE toggle. -->
+          <div id="pad" class="hold mb-3">
+            <div id="pad-dot"></div>
+            <div class="px-3">
+              <div id="pad-title" class="fw-semibold mb-1">
+                Drag to move the hand
+              </div>
+              <small id="pad-hint"
+                >one finger &rarr; forward / sideways<br />two fingers &rarr;
+                up / down</small
+              >
+            </div>
+          </div>
+
+          <!-- Which axes a drag means. "Hand" makes forward follow where the
+               gripper points, which is what you want for insertion; "World"
+               keeps axes fixed to the room. -->
+          <div class="btn-group w-100 mb-3" role="group">
+            <button id="frame-hand" class="btn btn-accent">
+              Hand-relative
             </button>
-            <button id="lift-down" class="btn btn-outline-light flex-fill hold">
-              &#9660; down
+            <button id="frame-world" class="btn btn-outline-light">
+              World axes
             </button>
           </div>
-          <button id="grip" class="btn btn-outline-light w-100">
-            Gripper: open
-          </button>
-        </div>
 
-        <div id="readouts" class="card bg-body-tertiary border-0 d-none"
-          <div class="card-body">
-            <div
-              class="d-flex align-items-baseline justify-content-between py-2"
-            >
-              <span>
-                Pitch
-                <small class="text-body-secondary d-block">beta &middot; deg</small>
-              </span>
-              <span id="pitch" class="reading fs-2">—</span>
+          <button id="grip" class="btn btn-outline-light w-100 py-3 mb-3 hold">
+            HOLD TO GRIP
+          </button>
+
+          <!-- Motion feedback: why the hand is or isn't moving. -->
+          <div class="card bg-body-tertiary border-0 mb-3">
+            <div class="card-body py-3">
+              <div class="d-flex justify-content-between small mb-1">
+                <span class="text-body-secondary">Hand speed</span>
+                <span><span id="speed" class="reading">—</span> m/s</span>
+              </div>
+              <div class="progress meter mb-3" role="progressbar">
+                <div id="speed-bar" class="progress-bar" style="width: 0%"></div>
+              </div>
+              <div class="d-flex justify-content-between small mb-1">
+                <span class="text-body-secondary">Reach used</span>
+                <span><span id="reach" class="reading">—</span> m</span>
+              </div>
+              <div class="progress meter" role="progressbar">
+                <div
+                  id="reach-bar"
+                  class="progress-bar bg-warning"
+                  style="width: 0%"
+                ></div>
+              </div>
+              <p id="reach-warn" class="small text-warning mb-0 mt-2 d-none">
+                At the reach limit — drag back the other way.
+              </p>
             </div>
-            <hr class="my-1" />
-            <div
-              class="d-flex align-items-baseline justify-content-between py-2"
-            >
-              <span>
-                Roll
-                <small class="text-body-secondary d-block"
-                  >gamma &middot; deg</small
-                >
-              </span>
-              <span id="roll" class="reading fs-2">—</span>
-            </div>
-            <hr class="my-1" />
-            <div
-              class="d-flex align-items-baseline justify-content-between py-2"
-            >
-              <span>
-                Yaw
-                <small class="text-body-secondary d-block"
-                  >alpha &middot; deg</small
-                >
-              </span>
-              <span id="yaw" class="reading fs-2">—</span>
-            </div>
-            <hr class="my-1" />
-            <div
-              class="d-flex align-items-center justify-content-between pt-2 small"
-            >
-              <span class="text-body-secondary">Socket</span>
-              <span>
-                <span id="sent" class="reading text-body-secondary"></span>
-                <span id="ws-status" class="badge text-bg-secondary ms-2"
-                  >connecting…</span
-                >
-              </span>
+          </div>
+
+          <div class="card bg-body-tertiary border-0">
+            <div class="card-body py-3 small">
+              <div class="d-flex justify-content-between py-1">
+                <span class="text-body-secondary">Pitch / Roll / Yaw</span>
+                <span>
+                  <span id="pitch" class="reading">—</span>
+                  <span id="roll" class="reading">—</span>
+                  <span id="yaw" class="reading">—</span>
+                </span>
+              </div>
+              <div class="d-flex justify-content-between py-1">
+                <span class="text-body-secondary">Offset x / y / z</span>
+                <span>
+                  <span id="ox" class="reading">—</span>
+                  <span id="oy" class="reading">—</span>
+                  <span id="oz" class="reading">—</span>
+                </span>
+              </div>
+              <div
+                class="d-flex align-items-center justify-content-between pt-2"
+              >
+                <span class="text-body-secondary">Socket</span>
+                <span>
+                  <span id="sent" class="reading text-body-secondary"></span>
+                  <span id="ws-status" class="badge text-bg-secondary ms-2"
+                    >connecting…</span
+                  >
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -171,15 +249,18 @@
     <script src="/static/device.js"></script>
     <script>
       const $ = (id) => document.getElementById(id);
-      const fmt = (v) => (v === null || v === undefined ? "—" : v.toFixed(1));
-      const round = (v) => (v === null || v === undefined ? 0 : +v.toFixed(2));
+      const fmt = (v, d = 1) =>
+        v === null || v === undefined ? "—" : v.toFixed(d);
+      const round = (v) => (v === null || v === undefined ? 0 : +v.toFixed(3));
 
       // --- Which arm does this phone drive? -----------------------------
-      const ARMS = ["left", "right"];
+      // Colours match the target spheres created in teleop.py build().
+      const ARM_COLOR = { left: "#3380ff", right: "#ff5926" };
       const arm = new URLSearchParams(location.search).get("arm");
-      const hasArm = ARMS.includes(arm);
+      const hasArm = arm in ARM_COLOR;
 
       if (hasArm) {
+        document.documentElement.style.setProperty("--accent", ARM_COLOR[arm]);
         const badge = $("arm-badge");
         badge.textContent = `${arm} arm`;
         badge.classList.remove("d-none");
@@ -199,8 +280,7 @@
         label.className = "text-body-secondary";
         label.textContent = name;
         const val = document.createElement("span");
-        val.textContent =
-          value === null ? "n/a" : value === true ? "yes" : "no";
+        val.textContent = value === null ? "n/a" : value === true ? "yes" : "no";
         val.className =
           value === true
             ? "text-success"
@@ -215,100 +295,167 @@
       verdict.textContent = isPhone ? "Phone" : "Not a phone";
       verdict.className = `badge ${isPhone ? "text-bg-success" : "text-bg-warning"}`;
 
-      const secure = window.isSecureContext;
       if (!isPhone) {
         $("not-phone").classList.remove("d-none");
-      } else if (!secure) {
+      } else if (!window.isSecureContext) {
         $("insecure-origin").textContent = window.location.origin;
         $("insecure").classList.remove("d-none");
       } else if (hasArm) {
-        // Without an arm the picker is showing instead; nothing to enable yet.
         $("imu-section").classList.remove("d-none");
       }
 
-      // --- Step 2: permission, then stream orientation -----------------
+      // --- Control state ------------------------------------------------
       const SEND_HZ = 20;
-      let latest = null;
-      let sent = 0;
-      let engaged = false;
+      const METRES_PER_PX = 0.0006; // ~18 cm per 300 px of drag
+
+      // Identifies this page load, so the teleop side can tell a reload (whose
+      // running total restarts at zero) from a genuine drag back to the origin.
+      const EPOCH = Math.floor(Math.random() * 1e9) + 1;
+
+      let angles = { pitch: 0, roll: 0, yaw: 0 };
+      let offset = { tx: 0, ty: 0, tz: 0 }; // cumulative metres since EPOCH
+      let rotate = false;
       let grip = false;
-      let lift = 0;
+      let frame = "hand"; // drag axes: follow the gripper by default
+      let sent = 0;
+
+      function onOrientation(e) {
+        angles = { pitch: e.beta, roll: e.gamma, yaw: e.alpha };
+        $("pitch").textContent = fmt(e.beta);
+        $("roll").textContent = fmt(e.gamma);
+        $("yaw").textContent = fmt(e.alpha);
+      }
+
+      // --- Trackpad: drag to translate -----------------------------------
+      // Screen axes are mapped so dragging away from you drives the hand
+      // forward (+x) and dragging right drives it to the robot's right (-y),
+      // matching the arrow-key jog in teleop.py.
+      function setupPad() {
+        const pad = $("pad");
+        const dot = $("pad-dot");
+        const active = new Map(); // pointerId -> {x, y}
+
+        const refresh = () => {
+          pad.classList.toggle("active", active.size > 0);
+        };
+
+        pad.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          pad.setPointerCapture(e.pointerId);
+          active.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          const r = pad.getBoundingClientRect();
+          dot.style.left = `${e.clientX - r.left}px`;
+          dot.style.top = `${e.clientY - r.top}px`;
+          refresh();
+        });
+
+        pad.addEventListener("pointermove", (e) => {
+          const prev = active.get(e.pointerId);
+          if (!prev) return;
+          e.preventDefault();
+          const dx = e.clientX - prev.x;
+          const dy = e.clientY - prev.y;
+          active.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+          if (active.size >= 2) {
+            // Two fingers: vertical drag becomes height. Halved because both
+            // pointers report the same motion and would otherwise double it.
+            offset.tz += -dy * METRES_PER_PX * 0.5;
+          } else {
+            offset.tx += -dy * METRES_PER_PX;
+            offset.ty += -dx * METRES_PER_PX;
+            const r = pad.getBoundingClientRect();
+            dot.style.left = `${e.clientX - r.left}px`;
+            dot.style.top = `${e.clientY - r.top}px`;
+          }
+        });
+
+        for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
+          pad.addEventListener(ev, (e) => {
+            active.delete(e.pointerId);
+            refresh();
+          });
+        }
+      }
 
       // A press-and-hold control. Release fires on every way a press can end,
       // so a finger sliding off never leaves the arm latched on.
       function onHold(el, press, release) {
         el.addEventListener("pointerdown", (e) => {
           e.preventDefault();
+          el.classList.add("on", "btn-accent");
+          el.classList.remove("btn-outline-light");
           press();
         });
         for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
           el.addEventListener(ev, (e) => {
             e.preventDefault();
+            el.classList.remove("on", "btn-accent");
+            el.classList.add("btn-outline-light");
             release();
           });
         }
       }
 
-      function setupControls() {
-        const clutch = $("clutch");
-        onHold(
-          clutch,
-          () => {
-            engaged = true;
-            clutch.textContent = "CONTROLLING";
-            clutch.classList.replace("btn-success", "btn-danger");
-          },
-          () => {
-            engaged = false;
-            clutch.textContent = "HOLD TO CONTROL";
-            clutch.classList.replace("btn-danger", "btn-success");
-          },
-        );
-
-        onHold(
-          $("lift-up"),
-          () => (lift = 1),
-          () => (lift = 0),
-        );
-        onHold(
-          $("lift-down"),
-          () => (lift = -1),
-          () => (lift = 0),
-        );
-
-        const gripBtn = $("grip");
-        gripBtn.addEventListener("click", () => {
-          grip = !grip;
-          gripBtn.textContent = `Gripper: ${grip ? "closed" : "open"}`;
-          gripBtn.classList.toggle("btn-warning", grip);
-          gripBtn.classList.toggle("btn-outline-light", !grip);
-        });
-
-        // Screen lock or tab-away must stop the arm dead, not leave it engaged.
-        const disengage = () => {
-          engaged = false;
-          lift = 0;
-        };
-        window.addEventListener("pagehide", disengage);
-        window.addEventListener("blur", disengage);
-        document.addEventListener("visibilitychange", () => {
-          if (document.hidden) disengage();
-        });
+      function setupFrameToggle() {
+        const buttons = { hand: $("frame-hand"), world: $("frame-world") };
+        for (const [name, el] of Object.entries(buttons)) {
+          el.addEventListener("click", () => {
+            frame = name;
+            for (const [other, btn] of Object.entries(buttons)) {
+              const on = other === name;
+              btn.classList.toggle("btn-accent", on);
+              btn.classList.toggle("btn-outline-light", !on);
+            }
+          });
+        }
       }
 
-      function onOrientation(e) {
-        $("pitch").textContent = fmt(e.beta);
-        $("roll").textContent = fmt(e.gamma);
-        $("yaw").textContent = fmt(e.alpha);
-        // Buffer the sample; the socket sends on its own fixed cadence so the
-        // sensor rate never dictates how much we put on the wire.
-        latest = { pitch: e.beta, roll: e.gamma, yaw: e.alpha };
+      // Latching toggle. Dragging stays available while it is on, so you can
+      // move and turn at the same time. Turning it on re-latches the phone
+      // attitude on the teleop side, so the hand never snaps.
+      function setRotate(on) {
+        rotate = on;
+        const btn = $("rotate");
+        btn.textContent = `ROTATE: ${on ? "ON" : "OFF"}`;
+        btn.classList.toggle("btn-accent", on);
+        btn.classList.toggle("btn-outline-light", !on);
+        $("pad-hint").innerHTML = on
+          ? "drag still moves it &middot; <strong>tilt now turns it</strong>"
+          : "one finger &rarr; forward / sideways<br />two fingers &rarr; up / down";
+      }
+
+      function setupControls() {
+        setupPad();
+        setupFrameToggle();
+        $("rotate").addEventListener("click", () => setRotate(!rotate));
+        setRotate(false);
+
+        onHold(
+          $("grip"),
+          () => (grip = true),
+          () => (grip = false),
+        );
+
+        // Losing the screen means losing control: clear ROTATE so a pocketed
+        // phone cannot keep turning the hand, and open the jaws. Only
+        // 'hidden'/'pagehide' -- a bare blur fires on things as minor as
+        // focusing the URL bar, which would switch it off under you.
+        const standDown = () => {
+          grip = false;
+          setRotate(false);
+        };
+        window.addEventListener("pagehide", standDown);
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) standDown();
+        });
       }
 
       // --- WebSocket ---------------------------------------------------
       // Origin-relative so this works over the tailnet, a LAN cert, or a
       // tunnel without hardcoding a host, and never trips mixed content.
       let ws = null;
+      let refused = false;
 
       function setStatus(text, variant) {
         const el = $("ws-status");
@@ -316,7 +463,14 @@
         el.className = `badge text-bg-${variant} ms-2`;
       }
 
-      let refused = false;
+      function onTelemetry(msg) {
+        $("speed").textContent = fmt(msg.speed, 2);
+        $("speed-bar").style.width = `${Math.min(100, (msg.speed / 0.5) * 100)}%`;
+        $("reach").textContent = fmt(msg.reach, 2);
+        const frac = msg.limit ? msg.reach / msg.limit : 0;
+        $("reach-bar").style.width = `${Math.min(100, frac * 100)}%`;
+        $("reach-warn").classList.toggle("d-none", frac < 0.98);
+      }
 
       function connect() {
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -324,8 +478,6 @@
 
         ws.addEventListener("open", () => setStatus("live", "success"));
 
-        // The server confirms the claim, or refuses it when the other phone
-        // already holds this arm. Retrying a refusal would just spam it.
         ws.addEventListener("message", (e) => {
           let msg;
           try {
@@ -333,7 +485,11 @@
           } catch {
             return;
           }
-          if (msg.type === "error") {
+          if (msg.type === "telemetry") {
+            onTelemetry(msg);
+          } else if (msg.type === "error") {
+            // Refused because the other phone already holds this arm.
+            // Retrying would just spam it.
             refused = true;
             setStatus("refused", "danger");
             const err = $("perm-error");
@@ -350,19 +506,27 @@
         ws.addEventListener("error", () => ws.close());
       }
 
+      // Send on a fixed cadence regardless of sensor rate, and always send the
+      // cumulative offset so a dropped frame cannot lose motion.
       function pump() {
-        if (!latest || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         ws.send(
           JSON.stringify({
-            pitch: round(latest.pitch),
-            roll: round(latest.roll),
-            yaw: round(latest.yaw),
-            engaged,
+            pitch: round(angles.pitch),
+            roll: round(angles.roll),
+            yaw: round(angles.yaw),
+            tx: round(offset.tx),
+            ty: round(offset.ty),
+            tz: round(offset.tz),
+            epoch: EPOCH,
+            frame,
+            rotate,
             grip,
-            lift,
           }),
         );
-        latest = null;
+        $("ox").textContent = fmt(offset.tx, 2);
+        $("oy").textContent = fmt(offset.ty, 2);
+        $("oz").textContent = fmt(offset.tz, 2);
         $("sent").textContent = `${++sent} sent`;
       }
 
@@ -382,8 +546,8 @@
           }
           window.addEventListener("deviceorientation", onOrientation);
           $("enable").classList.add("d-none");
+          $("check-card").classList.add("d-none");
           $("controls").classList.remove("d-none");
-          $("readouts").classList.remove("d-none");
           setupControls();
           connect();
           setInterval(pump, 1000 / SEND_HZ);
